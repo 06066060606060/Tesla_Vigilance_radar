@@ -15,4 +15,39 @@ catch(e){if(epoch===run){initialized=false;seen.clear();$('headline').textConten
 function stop(){run++;if(watch!==null)navigator.geolocation.clearWatch(watch);watch=null;clearTimeout(timer);position=null;previous=null;seen.clear();initialized=false;$('badge').className='pill';$('badge').textContent='EN ATTENTE';$('start').textContent='Activer la surveillance';$('headline').textContent='Prêt à démarrer';$('subtitle').textContent='Activez la localisation pour commencer.';empty('Activez la localisation pour afficher les points proches.')}
 $('start').onclick=()=>{if(watch!==null){stop();return}if(!navigator.geolocation){$('status').textContent='Géolocalisation indisponible : utilisez HTTPS ou localhost.';return}if($('sound').checked)beep();run++;initialized=false;$('status').textContent='Demande de localisation en cours…';watch=navigator.geolocation.watchPosition(p=>{const next={lat:p.coords.latitude,lon:p.coords.longitude,heading:null};if(Number.isFinite(p.coords.heading)&&p.coords.speed!==null&&p.coords.speed>=2)next.heading=p.coords.heading;else if(previous&&dist(previous.lat,previous.lon,next.lat,next.lon)>Math.max(30,p.coords.accuracy*1.5)){next.heading=bearing(previous,next)}if(!previous||dist(previous.lat,previous.lon,next.lat,next.lon)>Math.max(30,p.coords.accuracy*1.5))previous=next;position=next;$('badge').className='pill live';$('badge').textContent='SURVEILLANCE ACTIVE';$('start').textContent='Arrêter la surveillance';schedule()},e=>{stop();$('status').textContent='Localisation indisponible : '+e.message},{enableHighAccuracy:true,maximumAge:5000,timeout:20000})};
 $('test').onclick=beep;$('radius').onchange=()=>{initialized=false;schedule()};
-fetch('radars.csv').then(r=>{if(!r.ok)throw Error();return r.text()}).then(csv=>{radars=csv.replace(/^\uFEFF/,'').split(/\r?\n/).slice(1).map(line=>{let c=line.split(';');return{id:c[0],type:c[1],speed:c[3],lat:Number(c[4]),lon:Number(c[5])}}).filter(r=>r.id&&Number.isFinite(r.lat)&&Number.isFinite(r.lon)&&r.lat!==0&&r.lon!==0);$('status').textContent=radars.length.toLocaleString('fr-FR')+' points chargés · source officielle 12/2025';if(position)schedule()}).catch(()=>$('status').textContent='Impossible de charger les données. Ouvrez la page via un serveur web.');
+const DATA_API='https://www.data.gouv.fr/api/1/datasets/liste-des-radars-fixes-en-france/';
+const DATA_CACHE='tesla-vigilance-radars-v1';
+const BUNDLED_DATE='2025-12-30T13:42:47.222Z';
+let dataVersion=Date.parse(BUNDLED_DATE);
+function parseRadarCSV(csv){
+  const lines=csv.replace(/^\uFEFF/,'').split(/\r?\n/);
+  const headers=lines.shift().split(';').map(x=>x.trim().toLowerCase());
+  const fields=['type de radar','latitude','longitude'].map(x=>headers.indexOf(x));
+  const idIndex=headers.findIndex(x=>x.includes('radar')&&x.includes('ro de'));
+  const speedIndex=headers.findIndex(x=>x==='vma');
+  if(fields.some(i=>i<0)||idIndex<0||speedIndex<0)throw Error('Format CSV non reconnu');
+  const out=lines.map(line=>{const c=line.split(';');return {id:(c[idIndex]||'').trim(),type:(c[fields[0]]||'').trim(),speed:(c[speedIndex]||'').trim(),lat:Number(c[fields[1]]),lon:Number(c[fields[2]])}})
+    .filter(r=>/^\d+$/.test(r.id)&&/^[A-Z0-9]+$/.test(r.type)&&(!r.speed||/^\d+$/.test(r.speed))&&Number.isFinite(r.lat)&&Number.isFinite(r.lon)&&r.lat>=-90&&r.lat<=90&&r.lon>=-180&&r.lon<=180&&r.lat!==0&&r.lon!==0);
+  if(out.length<100)throw Error('Liste incomplète ou invalide');
+  return out;
+}
+function dateLabel(time){return new Date(time).toLocaleDateString('fr-FR',{day:'2-digit',month:'long',year:'numeric'})}
+function applyData(list,time,label){radars=list;dataVersion=time;$('data-status').textContent=list.length.toLocaleString('fr-FR')+' points · liste du '+dateLabel(time)+' · '+label;if(position)schedule()}
+async function checkedFetch(url,options={}){const controller=new AbortController(),timeout=setTimeout(()=>controller.abort(),12000);try{const r=await fetch(url,{...options,signal:controller.signal});if(!r.ok)throw Error('HTTP '+r.status);return await r.text()}finally{clearTimeout(timeout)}}
+async function loadRadarData(){
+  let stored=null;
+  try{stored=JSON.parse(localStorage.getItem(DATA_CACHE)||'null');if(stored&&Number.isFinite(Date.parse(stored.modified))&&Date.parse(stored.modified)>=dataVersion){applyData(parseRadarCSV(stored.csv),Date.parse(stored.modified),'cache local')}}catch(e){stored=null}
+  if(!radars.length){try{const bundled=await checkedFetch('radars.csv');applyData(parseRadarCSV(bundled),dataVersion,'copie incluse');try{localStorage.setItem(DATA_CACHE,JSON.stringify({modified:BUNDLED_DATE,csv:bundled}))}catch(e){}}catch(e){$('data-status').textContent='Aucune liste locale disponible ; recherche de la liste officielle…'}}
+  try{
+    const metadata=JSON.parse(await checkedFetch(DATA_API,{cache:'no-store'}));
+    const resources=(metadata.resources||[]).filter(r=>String(r.format).toLowerCase()==='csv'&&Number.isFinite(Date.parse(r.last_modified))&&typeof r.url==='string').sort((a,b)=>Date.parse(b.last_modified)-Date.parse(a.last_modified));
+    if(!resources.length)throw Error('Aucun fichier CSV officiel disponible');
+    const latest=resources[0],modified=Date.parse(latest.last_modified),url=new URL(latest.url);
+    if(url.protocol!=='https:'||!['static.data.gouv.fr','www.data.gouv.fr','data.gouv.fr'].includes(url.hostname))throw Error('Adresse du fichier non reconnue');
+    if(radars.length&&modified<=dataVersion){$('data-status').textContent=radars.length.toLocaleString('fr-FR')+' points · liste du '+dateLabel(dataVersion)+' · à jour';return}
+    const csv=await checkedFetch(url.href,{cache:'no-store'}),list=parseRadarCSV(csv);
+    applyData(list,modified,'mise à jour téléchargée');
+    try{localStorage.setItem(DATA_CACHE,JSON.stringify({modified:latest.last_modified,csv}));$('data-status').textContent+=' et mise en cache'}catch(e){$('data-status').textContent+=' · cache indisponible'}
+  }catch(e){if(radars.length)$('data-status').textContent=radars.length.toLocaleString('fr-FR')+' points · liste du '+dateLabel(dataVersion)+' · mise à jour non vérifiée';else $('data-status').textContent='Liste indisponible : vérifiez la connexion et rechargez la page.'}
+}
+loadRadarData();
